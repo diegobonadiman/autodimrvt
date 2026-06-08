@@ -1,0 +1,151 @@
+import clr
+clr.AddReference("RevitAPI")
+clr.AddReference("RevitServices")
+
+from Autodesk.Revit.DB import (
+    ReferenceArray, Line, XYZ, UV, Wall,
+    Options, PlanarFace, GeometryInstance, Solid
+)
+from RevitServices.Persistence import DocumentManager
+from RevitServices.Transactions import TransactionManager
+
+doc  = DocumentManager.Instance.CurrentDBDocument
+# Desembrulha (unwrap) explicitamente a vista vinda do IN[0]
+view = UnwrapElement(IN[0]) if IN[0] else doc.ActiveView
+
+# Garante que os elementos vêm como uma lista limpa do Dynamo
+raw_elements = UnwrapElement(IN[2])
+if not isinstance(raw_elements, list) and not hasattr(raw_elements, '__iter__'):
+    raw_elements = [raw_elements]
+
+offset_mm = float(IN[3]) if IN[3] is not None else 600.0
+
+def mm_para_pes(mm):
+    return mm / 304.8
+
+# Proteção 1: Filtra paredes garantindo que a propriedade Curve existe (evita falha com Paredes Empilhadas)
+paredes = [el for el in raw_elements
+           if isinstance(el, Wall)
+           and el.Location is not None
+           and hasattr(el.Location, "Curve")]
+
+log = []
+log.append(f"ViewType: {view.ViewType}")
+log.append(f"Paredes processadas: {len(paredes)}")
+
+if not paredes:
+    OUT = [None, "\n".join(log) + "\nErro: Nenhuma parede válida com linha de base encontrada."]
+    raise SystemExit
+
+curva        = paredes[0].Location.Curve
+vetor_parede = curva.GetEndPoint(1).Subtract(curva.GetEndPoint(0)).Normalize()
+vetor_perp   = XYZ(-vetor_parede.Y, vetor_parede.X, 0).Normalize()
+
+opts = Options()
+opts.View              = view
+opts.ComputeReferences = True
+
+candidatos = []
+
+for parede in paredes:
+    try:
+        geom = parede.get_Geometry(opts)
+        if geom is None:
+            continue
+
+        solids = []
+        for obj in geom:
+            if isinstance(obj, Solid) and obj.Volume > 1e-9:
+                solids.append(obj)
+            elif isinstance(obj, GeometryInstance):
+                for sub in obj.GetInstanceGeometry():
+                    if isinstance(sub, Solid) and sub.Volume > 1e-9:
+                        solids.append(sub)
+
+        face_min_score =  float('inf')
+        face_max_score = -float('inf')
+        face_min_ref   = None
+        face_max_ref   = None
+        face_min_pt    = None
+        face_max_pt    = None
+
+        for solid in solids:
+            for face in solid.Faces:
+                try:
+                    if not isinstance(face, PlanarFace):
+                        continue
+                    if face.Reference is None:
+                        continue
+                    normal = face.FaceNormal
+                    if abs(normal.DotProduct(vetor_parede)) < 0.70:
+                        continue
+
+                    # Proteção 2: Tenta ler Origin. Se falhar gerando "property cannot be read", faz fallback para Evaluate
+                    try:
+                        pt_f = face.Origin
+                    except:
+                        bb = face.GetBoundingBox()
+                        u = (bb.Min.U + bb.Max.U) / 2.0
+                        v = (bb.Min.V + bb.Max.V) / 2.0
+                        pt_f = face.Evaluate(UV(u, v))
+
+                    score = pt_f.DotProduct(vetor_parede)
+
+                    if score < face_min_score:
+                        face_min_score = score
+                        face_min_ref   = face.Reference
+                        face_min_pt    = pt_f
+                    if score > face_max_score:
+                        face_max_score = score
+                        face_max_ref   = face.Reference
+                        face_max_pt    = pt_f
+
+                except:
+                    # Um except vazio barra qualquer outra exceção do .NET sem parar o script principal
+                    continue
+
+        if face_min_ref:
+            candidatos.append((face_min_score, face_min_pt, face_min_ref))
+        if face_max_ref:
+            candidatos.append((face_max_score, face_max_pt, face_max_ref))
+
+    except Exception as e:
+        log.append(f"Parede {parede.Id}: EXCECAO={e}")
+
+if len(candidatos) < 2:
+    OUT = [None, "\n".join(log) + "\nErro: candidatos insuficientes."]
+    raise SystemExit
+
+candidatos.sort(key=lambda x: x[0])
+_, pt_min, ref_min = candidatos[0]
+_, pt_max, ref_max = candidatos[-1]
+
+refs = ReferenceArray()
+refs.Append(ref_min)
+refs.Append(ref_max)
+
+try:
+    z_vista = view.GenLevel.Elevation
+except:
+    z_vista = 0.0
+
+off    = mm_para_pes(offset_mm)
+p1_dim = XYZ(pt_min.X, pt_min.Y, z_vista).Add(vetor_perp.Multiply(off))
+p2_dim = XYZ(pt_max.X, pt_max.Y, z_vista).Add(vetor_perp.Multiply(off))
+dist   = p1_dim.DistanceTo(p2_dim)
+
+if dist < 0.01:
+    OUT = [None, "\n".join(log) + "\nErro: linha muito curta."]
+    raise SystemExit
+
+linha_cota = Line.CreateBound(p1_dim, p2_dim)
+
+TransactionManager.Instance.EnsureInTransaction(doc)
+try:
+    # Proteção 3: Usar NewDimension apenas com 3 parâmetros força o Revit a pegar o tipo Linear padrão.
+    dim = doc.Create.NewDimension(view, linha_cota, refs)
+    TransactionManager.Instance.TransactionTaskDone()
+    OUT = [dim, "\n".join(log) + f"\nSucesso! ID: {dim.Id}"]
+except Exception as e:
+    TransactionManager.Instance.ForceCloseTransaction()
+    OUT = [None, "\n".join(log) + f"\nRevit rejeitou: {e}"]
