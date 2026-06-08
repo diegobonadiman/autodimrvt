@@ -1,0 +1,589 @@
+{
+  "Uuid": "2ded2c37-da3b-4963-a1ca-e9e359cc8a29",
+  "IsCustomNode": false,
+  "Description": "",
+  "Name": "AutoDIMENSION_Dynamo - ver3",
+  "ElementResolver": {
+    "ResolutionMap": {}
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "DSRevitNodesUI.ElementsOfCategory, DSRevitNodesUI",
+      "Id": "b6925e07f4694207961b183195912141",
+      "NodeType": "ExtensionNode",
+      "Inputs": [
+        {
+          "Id": "63ab15bce20440b3b7428db027991dd7",
+          "Name": "Category",
+          "Description": "The Category",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "e21fad3f52ee48d9bc08e27146cfebd8",
+          "Name": "Elements",
+          "Description": "An element class.",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Obter todos os elementos da categoria especificada no modelo."
+    },
+    {
+      "ConcreteType": "DSRevitNodesUI.Categories, DSRevitNodesUI",
+      "SelectedIndex": 522,
+      "SelectedString": "OST_Walls",
+      "Id": "f12f6e83f8f34bbebed01b53b47b0719",
+      "NodeType": "ExtensionNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "4cf969375aee4b7d91491546cd473fbd",
+          "Name": "Category",
+          "Description": "The selected Category.",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Todas as categorias incorporadas."
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "import clr\r\n\r\nclr.AddReference(\"RevitAPI\")\r\nclr.AddReference(\"RevitServices\")\r\n\r\nimport Autodesk.Revit.DB as DB\r\nfrom RevitServices.Persistence import DocumentManager\r\nfrom RevitServices.Transactions import TransactionManager\r\n\r\n# Inicialização do documento e vista ativa\r\ndoc = DocumentManager.Instance.CurrentDBDocument\r\nview = doc.ActiveView\r\n\r\n# Tratamento dos inputs do Dynamo\r\nraw = IN[2] if isinstance(IN[2], list) else [IN[2]]\r\nelementos = [el.InternalElement if hasattr(el, \"InternalElement\") else el \r\n             for el in raw if el is not None]\r\n\r\n# Configuração de distanciamento das cotas (em mm para pés)\r\noffset_mm = float(IN[3]) if IN[3] is not None else 600.0\r\noff = offset_mm / 304.8\r\ndist_entre_linhas = 400.0 / 304.8 # Distância entre a cota parcial e a cota total\r\n\r\n# Filtrar apenas paredes válidas\r\nparedes = [el for el in elementos if isinstance(el, DB.Wall) and el.Location is not None]\r\n\r\ndimensoes_criadas = []\r\nlog = []\r\n\r\ntodos_pts = []\r\nx_faces = []\r\ny_faces = []\r\n\r\n# 1. Coleta direcionada usando apenas as superfícies principais das paredes\r\nfor p in paredes:\r\n    try:\r\n        c = p.Location.Curve\r\n        if isinstance(c, DB.Line):\r\n            todos_pts.append(c.GetEndPoint(0))\r\n            todos_pts.append(c.GetEndPoint(1))\r\n            \r\n        # Coleta apenas as referências das faces externas e internas brutas\r\n        ext_refs = DB.HostObjectUtils.GetSideFaces(p, DB.ShellLayerType.Exterior)\r\n        int_refs = DB.HostObjectUtils.GetSideFaces(p, DB.ShellLayerType.Interior)\r\n        refs_parede = list(ext_refs) + list(int_refs)\r\n        \r\n        for r in refs_parede:\r\n            face = p.GetGeometryObjectFromReference(r)\r\n            if isinstance(face, DB.PlanarFace):\r\n                normal = face.FaceNormal\r\n                # Separação estrita por ortogonalidade\r\n                if abs(normal.X) > 0.99 and abs(normal.Y) < 0.01:\r\n                    x_faces.append((face.Origin.X, r))\r\n                elif abs(normal.Y) > 0.99 and abs(normal.X) < 0.01:\r\n                    y_faces.append((face.Origin.Y, r))\r\n    except Exception as e:\r\n        continue\r\n\r\nif todos_pts:\r\n    x_min = min(pt.X for pt in todos_pts)\r\n    x_max = max(pt.X for pt in todos_pts)\r\n    y_min = min(pt.Y for pt in todos_pts)\r\n    y_max = max(pt.Y for pt in todos_pts)\r\n    \r\n    try: z = view.GenLevel.Elevation\r\n    except: z = 0.0\r\n\r\n    # Função para agrupar e eliminar linhas coincidentes ou fantasmas (tol = 2cm)\r\n    def consolidar_linhas(lista_faces, tol=0.06):\r\n        if not lista_faces: return []\r\n        lista_faces.sort(key=lambda x: x[0])\r\n        filtrados = [lista_faces[0]]\r\n        for item in lista_faces[1:]:\r\n            if abs(item[0] - filtrados[-1][0]) > tol:\r\n                filtrados.append(item)\r\n        return filtrados\r\n\r\n    x_limpas = consolidar_linhas(x_faces)\r\n    y_limpas = consolidar_linhas(y_faces)\r\n\r\n    # Selecionar o tipo de cota\r\n    dim_type = None\r\n    for dt in DB.FilteredElementCollector(doc).OfClass(DB.DimensionType):\r\n        if \"alinhad\" in dt.Name.lower() or \"linear\" in dt.Name.lower():\r\n            dim_type = dt\r\n            break\r\n    if dim_type is None:\r\n        dim_type = DB.FilteredElementCollector(doc).OfClass(DB.DimensionType).FirstElement()\r\n\r\n    TransactionManager.Instance.EnsureInTransaction(doc)\r\n\r\n    # ==================== EIXO X (COTAS HORIZONTAIS) ====================\r\n    if len(x_limpas) >= 2:\r\n        try:\r\n            # A. Cota Parcial (Segmentada)\r\n            refs_x_parcial = DB.ReferenceArray()\r\n            for coord, ref in x_limpas: refs_x_parcial.Append(ref)\r\n            \r\n            p1_p = DB.XYZ(x_limpas[0][0], y_min - off, z)\r\n            p2_p = DB.XYZ(x_limpas[-1][0], y_min - off, z)\r\n            linha_x_p = DB.Line.CreateBound(p1_p, p2_p)\r\n            dimensoes_criadas.append(doc.Create.NewDimension(view, linha_x_p, refs_x_parcial, dim_type))\r\n            \r\n            # B. Cota Total (Apenas extremidades para limpeza visual)\r\n            refs_x_total = DB.ReferenceArray()\r\n            refs_x_total.Append(x_limpas[0][1])\r\n            refs_x_total.Append(x_limpas[-1][1])\r\n            \r\n            p1_t = DB.XYZ(x_limpas[0][0], y_min - off - dist_entre_linhas, z)\r\n            p2_t = DB.XYZ(x_limpas[-1][0], y_min - off - dist_entre_linhas, z)\r\n            linha_x_t = DB.Line.CreateBound(p1_t, p2_t)\r\n            dimensoes_criadas.append(doc.Create.NewDimension(view, linha_x_t, refs_x_total, dim_type))\r\n        except Exception as e: log.append(f\"Erro no Eixo X: {str(e)}\")\r\n\r\n    # ==================== EIXO Y (COTAS VERTICAIS) ====================\r\n    if len(y_limpas) >= 2:\r\n        try:\r\n            # A. Cota Parcial (Segmentada)\r\n            refs_y_parcial = DB.ReferenceArray()\r\n            for coord, ref in y_limpas: refs_y_parcial.Append(ref)\r\n            \r\n            p1_p = DB.XYZ(x_min - off, y_limpas[0][0], z)\r\n            p2_p = DB.XYZ(x_min - off, y_limpas[-1][0], z)\r\n            linha_y_p = DB.Line.CreateBound(p1_p, p2_p)\r\n            dimensoes_criadas.append(doc.Create.NewDimension(view, linha_y_p, refs_y_parcial, dim_type))\r\n            \r\n            # B. Cota Total (Apenas extremidades)\r\n            refs_y_total = DB.ReferenceArray()\r\n            refs_y_total.Append(y_limpas[0][1])\r\n            refs_y_total.Append(y_limpas[-1][1])\r\n            \r\n            p1_t = DB.XYZ(x_min - off - dist_entre_linhas, y_limpas[0][0], z)\r\n            p2_t = DB.XYZ(x_min - off - dist_entre_linhas, y_limpas[-1][0], z)\r\n            linha_y_t = DB.Line.CreateBound(p1_t, p2_t)\r\n            dimensoes_criadas.append(doc.Create.NewDimension(view, linha_y_t, refs_y_total, dim_type))\r\n        except Exception as e: log.append(f\"Erro no Eixo Y: {str(e)}\")\r\n\r\n    TransactionManager.Instance.TransactionTaskDone()\r\n\r\nOUT = [dimensoes_criadas, log]",
+      "Engine": "IronPython3",
+      "VariableInputPorts": true,
+      "Id": "a4ec57f1f23a47229ff374ec5ca6411f",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "c04a963f98f046c7a85ac4de38401ee4",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "ac8703fda6ca453ba18777f8e8ba8f02",
+          "Name": "IN[1]",
+          "Description": "Input #1",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "80eabd8b1b5043329518e4f5452605ed",
+          "Name": "IN[2]",
+          "Description": "Input #2",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "2adaef7a5a77455cbb1148bcb9fff5d8",
+          "Name": "IN[3]",
+          "Description": "Input #3",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "a4ebc044747e4c5e932a99732fa5704b",
+          "Name": "OUT",
+          "Description": "Result of the python script",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Executa um script Python incorporado."
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Watch, CoreNodeModels",
+      "WatchWidth": 95.2,
+      "WatchHeight": 40.0,
+      "Id": "f2a8f81276314400abc684d7853f6d48",
+      "NodeType": "ExtensionNode",
+      "Inputs": [
+        {
+          "Id": "d7c2c38e6c834709a1a1f42968c74024",
+          "Name": "",
+          "Description": "Node to show output from",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "8e78a60d6296495dabb5aa209032fb42",
+          "Name": "",
+          "Description": "Node output",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Visualiza a saída de um nó"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "402a783ce2054806ab1789029b171fa1",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "00f821e2547f4c8394840b98bb5541e5",
+          "Name": "document",
+          "Description": "Revit.Application.Document",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "9a943d1de0914c9092033675b770ca54",
+          "Name": "View",
+          "Description": "View",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "Revit.Application.Document.ActiveView",
+      "Replication": "Auto",
+      "Description": "Obter a vista ativa para o documento\n\nDocument.ActiveView: View"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "65b296d766d7408881e6a14f4d71d5dc",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "fc1ef8c9bd13473192e24ce8e5389406",
+          "Name": "integer",
+          "Description": "600",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Permite que o código DesignScript seja criado diretamente",
+      "Code": "600;"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "21b2670954fe4d8983c70e20f69dc22b",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "b45cfadd36d149419dc0b876a0f35495",
+          "Name": "list",
+          "Description": "Lista da qual obter um item.\n\nvar[]..[]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "b87ab244248442c2bc9deabcff6a2c27",
+          "Name": "index",
+          "Description": "Índice do item a ser extraído.\n\nint",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "0c0c2cde6c5e451b95e36035845219ef",
+          "Name": "item",
+          "Description": "Item na lista no determinado índice.",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "DSCore.List.GetItemAtIndex@var[]..[],int",
+      "Replication": "Auto",
+      "Description": "Retorna um item de uma determinada lista que está localizada no índice especificado.\n\nList.GetItemAtIndex (list: var[]..[], index: int): var[]..[]"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "d9c9f92134c9488a87579ea4c82f18f1",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "55c7267e89284a26904e0b00121e2941",
+          "Name": "integer",
+          "Description": "1",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Permite que o código DesignScript seja criado diretamente",
+      "Code": "1;"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "0ed48f2b434247fa960b3e0c295e7eb6",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "662012ba1f2a4c58847d6f92b5e94a8e",
+          "Name": "list",
+          "Description": "Lista da qual obter um item.\n\nvar[]..[]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "69b724e90e3c4d93a9b075d87a266cf7",
+          "Name": "index",
+          "Description": "Índice do item a ser extraído.\n\nint",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "549a3087c6a5417dad0c608880b19fbd",
+          "Name": "item",
+          "Description": "Item na lista no determinado índice.",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "DSCore.List.GetItemAtIndex@var[]..[],int",
+      "Replication": "Auto",
+      "Description": "Retorna um item de uma determinada lista que está localizada no índice especificado.\n\nList.GetItemAtIndex (list: var[]..[], index: int): var[]..[]"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "2a66c3571e424a35ba00c4e68df5f947",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "b08a688e80724217af93114213bb75df",
+          "Name": "integer",
+          "Description": "0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Permite que o código DesignScript seja criado diretamente",
+      "Code": "0;"
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Watch, CoreNodeModels",
+      "WatchWidth": 200.0,
+      "WatchHeight": 40.0,
+      "Id": "d1e45213096646f6a4a28d86598288f4",
+      "NodeType": "ExtensionNode",
+      "Inputs": [
+        {
+          "Id": "50e8f1e053c74afe8114076c7a83b414",
+          "Name": "",
+          "Description": "Nó do qual a saída é exibida",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "f16b1b6518914a32a0f752327a8a77d3",
+          "Name": "",
+          "Description": "Saída do nó",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Visualiza a saída de um nó"
+    }
+  ],
+  "Connectors": [
+    {
+      "Start": "e21fad3f52ee48d9bc08e27146cfebd8",
+      "End": "80eabd8b1b5043329518e4f5452605ed",
+      "Id": "b3374af4973b48cebcfd9ffa59275a76",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "4cf969375aee4b7d91491546cd473fbd",
+      "End": "63ab15bce20440b3b7428db027991dd7",
+      "Id": "5c35d34f3e6d4c1eaf0e4bfd96f6f568",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "a4ebc044747e4c5e932a99732fa5704b",
+      "End": "b45cfadd36d149419dc0b876a0f35495",
+      "Id": "92fb92c0d16a449e83c1d159c5be2d16",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "a4ebc044747e4c5e932a99732fa5704b",
+      "End": "662012ba1f2a4c58847d6f92b5e94a8e",
+      "Id": "875f50ccf5d948b99d5ceff10441e282",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "9a943d1de0914c9092033675b770ca54",
+      "End": "ac8703fda6ca453ba18777f8e8ba8f02",
+      "Id": "27cecc3bffd44f2fada30be9d2a9f82f",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "fc1ef8c9bd13473192e24ce8e5389406",
+      "End": "2adaef7a5a77455cbb1148bcb9fff5d8",
+      "Id": "a04c2cb11ada4bf7bff21b941e0337c4",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "0c0c2cde6c5e451b95e36035845219ef",
+      "End": "d7c2c38e6c834709a1a1f42968c74024",
+      "Id": "8901569a4e0444c2b3bed941a70c4ec3",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "55c7267e89284a26904e0b00121e2941",
+      "End": "b87ab244248442c2bc9deabcff6a2c27",
+      "Id": "bf65a09d2a394923b367e24797285c32",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "549a3087c6a5417dad0c608880b19fbd",
+      "End": "50e8f1e053c74afe8114076c7a83b414",
+      "Id": "368edb37acb749fe88a7ca70e3ecba98",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "b08a688e80724217af93114213bb75df",
+      "End": "69b724e90e3c4d93a9b075d87a266cf7",
+      "Id": "e2cf51cb877145ad917c4e7e072fdfe1",
+      "IsHidden": "False"
+    }
+  ],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [
+    {
+      "Name": "DynamoIronPython3",
+      "Version": "1.6.0",
+      "ReferenceType": "Package",
+      "Nodes": [
+        "a4ec57f1f23a47229ff374ec5ca6411f"
+      ]
+    }
+  ],
+  "EnableLegacyPolyCurveBehavior": true,
+  "Thumbnail": "",
+  "GraphDocumentationURL": null,
+  "ExtensionWorkspaceData": [
+    {
+      "ExtensionGuid": "28992e1d-abb9-417f-8b1b-05e053bee670",
+      "Name": "Properties",
+      "Version": "3.6",
+      "Data": {}
+    },
+    {
+      "ExtensionGuid": "DFBD9CC0-DB40-457A-939E-8C8555555A9D",
+      "Name": "Generative Design",
+      "Version": "9.1",
+      "Data": {}
+    }
+  ],
+  "Author": "",
+  "Linting": {
+    "activeLinter": "Nenhum",
+    "activeLinterId": "7b75fb44-43fd-4631-a878-29f4d5d8399a",
+    "warningCount": 0,
+    "errorCount": 0
+  },
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 100.0,
+      "HasRunWithoutCrash": true,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "3.6.1.9895",
+      "RunType": "Manual",
+      "RunPeriod": "1000"
+    },
+    "Camera": {
+      "Name": "_Visualização do plano de fundo",
+      "EyeX": -17.0,
+      "EyeY": 24.0,
+      "EyeZ": 50.0,
+      "LookX": 12.0,
+      "LookY": -13.0,
+      "LookZ": -58.0,
+      "UpX": 0.0,
+      "UpY": 1.0,
+      "UpZ": 0.0
+    },
+    "ConnectorPins": [],
+    "NodeViews": [
+      {
+        "Id": "b6925e07f4694207961b183195912141",
+        "Name": "All Elements of Category",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 1683.196987011009,
+        "Y": 2096.4975533900606
+      },
+      {
+        "Id": "f12f6e83f8f34bbebed01b53b47b0719",
+        "Name": "Categories",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 1313.3232172258397,
+        "Y": 2084.055699367292
+      },
+      {
+        "Id": "a4ec57f1f23a47229ff374ec5ca6411f",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 2391.524541653383,
+        "Y": 1994.015646918418
+      },
+      {
+        "Id": "f2a8f81276314400abc684d7853f6d48",
+        "Name": "Watch",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 3186.865801431744,
+        "Y": 1742.4415143336946
+      },
+      {
+        "Id": "402a783ce2054806ab1789029b171fa1",
+        "Name": "Document.ActiveView",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 2015.068563754909,
+        "Y": 1972.3420952660158
+      },
+      {
+        "Id": "65b296d766d7408881e6a14f4d71d5dc",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 1982.3143390922978,
+        "Y": 2275.9461055458305
+      },
+      {
+        "Id": "21b2670954fe4d8983c70e20f69dc22b",
+        "Name": "List.GetItemAtIndex",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 2898.8595106850826,
+        "Y": 1746.8846690628839
+      },
+      {
+        "Id": "d9c9f92134c9488a87579ea4c82f18f1",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 2851.1150079111776,
+        "Y": 1910.4322443595636
+      },
+      {
+        "Id": "0ed48f2b434247fa960b3e0c295e7eb6",
+        "Name": "List.GetItemAtIndex",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 2736.6444327272675,
+        "Y": 2205.469592694093
+      },
+      {
+        "Id": "2a66c3571e424a35ba00c4e68df5f947",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 2434.6737540350514,
+        "Y": 2431.4736386727927
+      },
+      {
+        "Id": "d1e45213096646f6a4a28d86598288f4",
+        "Name": "Watch",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 3005.949605361668,
+        "Y": 2295.7853518092884
+      }
+    ],
+    "Annotations": [],
+    "X": -1446.120314873951,
+    "Y": -1265.2490984806993,
+    "Zoom": 0.7423128380597951
+  }
+}
